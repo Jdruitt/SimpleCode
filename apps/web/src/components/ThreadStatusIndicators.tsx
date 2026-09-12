@@ -414,12 +414,7 @@ export function ThreadWorktreeIndicator({
           />
         }
       >
-        {/* Full-strength muted, not the /40 the neighbouring branch text uses:
-            which checkout a thread runs in is the one thing a row cannot say
-            in words, so the marker has to survive a glance down a long list.
-            Neutral rather than coloured keeps it out of the way of the live
-            status icons beside it, which own colour in this row. */}
-        <FolderGit2Icon className="size-3 text-muted-foreground" />
+        <FolderGit2Icon className="size-3 text-muted-foreground/40" />
       </TooltipTrigger>
       <TooltipPopup side="top">{tooltip}</TooltipPopup>
     </Tooltip>
