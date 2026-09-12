@@ -2730,6 +2730,61 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 });
 
 describe("parseAgentSessionTranscript", () => {
+  const claudeUser = (content: string, timestamp = "2026-08-24T10:00:00.000Z") =>
+    JSON.stringify({
+      type: "user",
+      sessionId: "claude-session",
+      timestamp,
+      message: { role: "user", content },
+    });
+
+  it("prefers the latest Claude custom title", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({ type: "custom-title", customTitle: "Wellness hub", sessionId: "s" }),
+        claudeUser("Build the wellness hub server"),
+        JSON.stringify({ type: "custom-title", customTitle: "Wellness center hub server" }),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Wellness center hub server");
+  });
+
+  it("derives the title from the prompt behind injected context markup", () => {
+    const prompt =
+      "<system-reminder>\nYou are operating in a git worktree.\nWorktree path: /repo/.claude/worktrees/x\n</system-reminder>\n\n<recommended_plugins>\nInstall foo.\n</recommended_plugins>\nhi mate, do you know the reason age filter is slow?\nSecond line.";
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [claudeUser(prompt)].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("hi mate, do you know the reason age filter is slow?");
+    // Imported history keeps the prompt as written; only the title is cleaned.
+    expect(thread?.messages.map((message) => message.text)).toEqual([prompt]);
+  });
+
+  it("falls back to a later user message when the first one is only context markup", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        claudeUser("<system-reminder>\nOnly context.\n</system-reminder>"),
+        claudeUser("Real question", "2026-08-24T10:01:00.000Z"),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Real question");
+  });
+
   it.each([false, true])(
     "handles the exact record limit and an interior blank overflow=%s",
     (overflow) => {
@@ -3219,7 +3274,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
     });
 
-    expect(thread?.title).toBe("<environment_context>");
+    expect(thread?.title).toBe("Initialize Git and add a README.");
     expect(thread?.messages.map((message) => message.text)).toEqual([
       context,
       "Initialize Git and add a README.",
@@ -3246,7 +3301,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
     });
 
-    expect(thread?.title).toBe("<environment_context>");
+    expect(thread?.title).toBe("Create a useful project.");
     expect(thread?.messages.map((message) => message.text)).toEqual([prompt]);
   });
 
