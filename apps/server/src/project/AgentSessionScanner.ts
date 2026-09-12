@@ -116,6 +116,7 @@ const TranscriptRecord = Schema.Struct({
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
   aiTitle: Schema.optional(Schema.String),
+  customTitle: Schema.optional(Schema.String),
   isSidechain: Schema.optional(Schema.Boolean),
   isMeta: Schema.optional(Schema.Boolean),
   isCompactSummary: Schema.optional(Schema.Boolean),
@@ -256,6 +257,26 @@ function selectMetadataTranscripts(transcripts: ReadonlyArray<TranscriptCandidat
 function splitTranscriptRecords(contents: string, limit: number): string[] {
   const records = contents.endsWith("\n") ? contents.slice(0, -1) : contents;
   return records.split("\n", limit);
+}
+
+const MAX_DERIVED_TITLE_LENGTH = 100;
+const MARKUP_BLOCK_PATTERN = /<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
+const BARE_TAG_LINE_PATTERN = /^<\/?[a-z][\w-]*(?:\s[^>]*)?>$/i;
+
+/**
+ * Title from a prompt as the user typed it. Both CLIs prepend context markup
+ * to prompts (`<system-reminder>`, `<environment_context>`, plugin hints), so
+ * the raw first line is rarely the request. Drop complete markup blocks and
+ * bare tag lines, then take the first line left. The imported message text is
+ * never altered, only the title.
+ */
+function deriveTitleFromPrompt(text: string): string | null {
+  for (const line of text.replace(MARKUP_BLOCK_PATTERN, "").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || BARE_TAG_LINE_PATTERN.test(trimmed)) continue;
+    return trimmed.slice(0, MAX_DERIVED_TITLE_LENGTH).trim();
+  }
+  return null;
 }
 
 function extractText(
@@ -413,6 +434,11 @@ function parseAgentSessionRecords(
       }
       if (record.sessionId?.trim()) providerSessionId = record.sessionId.trim();
       if (record.aiTitle?.trim()) title = record.aiTitle.trim();
+      // Newer Claude Code writes the session name (also editable in Claude
+      // Desktop) as `custom-title` records; the latest one is current.
+      if (record.type === "custom-title" && record.customTitle?.trim()) {
+        title = record.customTitle.trim();
+      }
       const messageModel = record.message?.model?.trim();
       // Claude uses this sentinel for local error responses. It is not a
       // model ID that can be selected when the imported session resumes.
@@ -500,7 +526,14 @@ function parseAgentSessionRecords(
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
     : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
-  const derivedTitle = visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
+  // The first prompt often opens with injected context; the first prompt
+  // with words of its own names the thread. Fall back to the raw first line.
+  const derivedTitle =
+    [visibleFirstUserMessage, ...visibleMessages]
+      .filter((message) => message.role === "user")
+      .map((message) => deriveTitleFromPrompt(message.text))
+      .find((candidate) => candidate !== null) ??
+    visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
 
   return {
     source: input.source,

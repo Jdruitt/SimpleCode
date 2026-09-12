@@ -66,6 +66,11 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
   }
 }
 
+/** A title taken from injected context such as `<system-reminder>` rather than the prompt. */
+function isMarkupTitle(title: string): boolean {
+  return title.trimStart().startsWith("<");
+}
+
 function hasImportedHistory(thread: OrchestrationThread): boolean {
   return thread.messages.some((message) => isImportedAgentSessionMessageId(message.id));
 }
@@ -128,9 +133,29 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
     .pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
     );
+  // Threads named after injected context markup were imported before the
+  // title rules learned to skip it. Leaving their transcripts out of the
+  // completed set makes the scanner read exactly those once more, and the
+  // existing thread takes the better title below. Every other completed
+  // transcript stays closed, which keeps retries cheap.
+  const retitleThreadIds = new Set<ThreadId>();
+  for (const entry of completedSources) {
+    const existing = yield* snapshots
+      .getThreadDetailById(entry.threadId)
+      .pipe(Effect.orElseSucceed(() => Option.none<OrchestrationThread>()));
+    if (
+      Option.isSome(existing) &&
+      isMarkupTitle(existing.value.title) &&
+      !hasImportBlockingActivity(existing.value, true)
+    ) {
+      retitleThreadIds.add(entry.threadId);
+    }
+  }
   const threads = scanner.recentThreads(
     workspaceRoot,
-    completedSources.map((entry) => entry.source),
+    completedSources.flatMap((entry) =>
+      retitleThreadIds.has(entry.threadId) ? [] : [entry.source],
+    ),
   );
   const importedThreadIds = new Set<ThreadId>();
   let importedCount = 0;
@@ -199,6 +224,22 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
           importedHistoryPresent &&
           Option.isSome(existingBinding)
         ) {
+          // The transcript was read again, either because it changed (the
+          // user renamed or continued it in their CLI) or because its thread
+          // was named after context markup. Follow the transcript's title
+          // while the thread is still import-only; once the user has worked
+          // in it here, the T3 title is theirs.
+          if (
+            existingThread.value.title !== thread.title &&
+            !hasImportBlockingActivity(existingThread.value, true)
+          ) {
+            yield* engine.dispatch({
+              type: "thread.meta.update",
+              commandId: CommandId.make(yield* crypto.randomUUIDv4),
+              threadId,
+              title: thread.title,
+            });
+          }
           yield* directory.recordImportedTranscript({ threadId, source: outcome.source });
           return true;
         }

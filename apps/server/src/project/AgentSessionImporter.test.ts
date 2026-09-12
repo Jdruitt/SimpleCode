@@ -8,6 +8,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  type AgentSessionImportSource,
   type OrchestrationCommand,
   type OrchestrationProjectShell,
   type OrchestrationThread,
@@ -174,11 +175,15 @@ const makeProjectedThread = (input: {
 const makeSnapshotsLayer = (input: {
   readonly project?: OrchestrationProjectShell;
   readonly getThread?: (threadId: ThreadId) => Option.Option<OrchestrationThread>;
+  readonly importedSources?: ReadonlyArray<{
+    readonly threadId: ThreadId;
+    readonly source: AgentSessionImportSource;
+  }>;
 }) =>
   Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
     getProjectShellById: () =>
       Effect.succeed(input.project === undefined ? Option.none() : Option.some(input.project)),
-    getImportedAgentSessionSources: () => Effect.succeed([]),
+    getImportedAgentSessionSources: () => Effect.succeed(input.importedSources ?? []),
     getThreadDetailById: (threadId) => Effect.succeed(input.getThread?.(threadId) ?? Option.none()),
   });
 
@@ -334,6 +339,104 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
           { branch: worktree.branch, worktreePath: worktree.path, historyImport: true },
         ]);
         expect(bindings).toMatchObject([{ runtimePayload: { cwd: worktree.path } }]);
+      }),
+    );
+
+    it.effect("retitles untouched imported threads named after context markup", () =>
+      Effect.gen(function* () {
+        const commands: Array<OrchestrationCommand> = [];
+        let completedSources: ReadonlyArray<AgentSessionImportSource> | undefined;
+        const codex = makeThreadOutcome({
+          ...makeThread("codex"),
+          title: "Wellness center hub server",
+        });
+        const claude = makeThreadOutcome({ ...makeThread("claudeAgent"), title: "A better title" });
+        // History import settles the thread; a follow-up marks it as touched.
+        const codexThread = {
+          ...makeProjectedThread({ source: "codex", imported: true }),
+          title: "<system-reminder>",
+          settledOverride: "settled" as const,
+        };
+        const claudeThread = {
+          ...makeProjectedThread({ source: "claudeAgent", imported: true, includeFollowup: true }),
+          title: "<system-reminder>",
+          settledOverride: "settled" as const,
+        };
+        const scanner = AgentSessionScanner.AgentSessionScanner.of({
+          scan: Effect.die("unused"),
+          recentThreads: (_workspaceRoot, completed) => {
+            completedSources = completed;
+            // Only the transcript left out of the completed set is read again.
+            return Stream.fromIterable([codex]);
+          },
+        });
+        const engine = OrchestrationEngine.OrchestrationEngineService.of({
+          dispatch: (command) => Effect.sync(() => ({ sequence: commands.push(command) })),
+          readEvents: () => Stream.empty,
+          readThreadEvents: () => Stream.empty,
+          getThreadReplayStats: () => Effect.die("unused"),
+          streamDomainEvents: Stream.empty,
+          subscribeDomainEvents: Effect.succeed(Stream.empty),
+          latestSequence: Effect.succeed(0),
+        });
+        const stoppedBinding = (thread: typeof codexThread) =>
+          Option.some({
+            threadId: thread.id,
+            provider: ProviderDriverKind.make(
+              thread.id.includes(":codex:") ? "codex" : "claudeAgent",
+            ),
+            providerInstanceId: ProviderInstanceId.make(
+              thread.id.includes(":codex:") ? "codex" : "claudeAgent",
+            ),
+            status: "stopped" as const,
+            resumeCursor: { threadId: "session" },
+          });
+        const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+          upsert: () => Effect.die("must not replace an existing binding"),
+          getProvider: () => Effect.die("unused"),
+          recordImportedTranscript: () => Effect.void,
+          getBinding: (threadId) =>
+            Effect.succeed(
+              threadId === codexThread.id
+                ? stoppedBinding(codexThread)
+                : threadId === claudeThread.id
+                  ? stoppedBinding(claudeThread)
+                  : Option.none(),
+            ),
+          listThreadIds: () => Effect.die("unused"),
+          listBindings: () => Effect.die("unused"),
+        });
+
+        const result = yield* runImport({
+          scanner,
+          engine,
+          directory,
+          snapshots: makeSnapshotsLayer({
+            project: makeProject(),
+            importedSources: [
+              { threadId: codexThread.id, source: codex.source },
+              { threadId: claudeThread.id, source: claude.source },
+            ],
+            getThread: (threadId) =>
+              threadId === codexThread.id
+                ? Option.some(codexThread)
+                : threadId === claudeThread.id
+                  ? Option.some(claudeThread)
+                  : Option.none(),
+          }),
+        });
+
+        // The Claude thread has a follow-up typed in T3, so it stays completed
+        // and keeps its title; the untouched Codex thread is re-read and renamed.
+        expect(completedSources).toEqual([claude.source]);
+        expect(result).toEqual({ importedCount: 1, skippedCount: 0 });
+        expect(commands).toMatchObject([
+          {
+            type: "thread.meta.update",
+            threadId: codexThread.id,
+            title: "Wellness center hub server",
+          },
+        ]);
       }),
     );
 
