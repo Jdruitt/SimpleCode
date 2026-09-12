@@ -80,10 +80,14 @@ const makeThread = (source: "codex" | "claudeAgent"): AgentSessionScanner.AgentS
   ],
 });
 
-const makeThreadOutcome = (thread: AgentSessionScanner.AgentSessionThread) =>
+const makeThreadOutcome = (
+  thread: AgentSessionScanner.AgentSessionThread,
+  worktree: { readonly path: string; readonly branch: string | null } | null = null,
+) =>
   ({
     _tag: "Importable",
     thread,
+    worktree,
     source: {
       provider: thread.source,
       providerInstanceId: thread.providerInstanceId,
@@ -284,6 +288,52 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
             runtimePayload: { cwd: WORKSPACE_ROOT },
           },
         ]);
+      }),
+    );
+
+    it.effect("creates worktree sessions as worktree threads that resume in the worktree", () =>
+      Effect.gen(function* () {
+        const commands: Array<OrchestrationCommand> = [];
+        const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
+        const worktree = {
+          path: `${WORKSPACE_ROOT}/.claude/worktrees/feature-1e19b3`,
+          branch: "claude/feature-1e19b3",
+        };
+        const scanner = AgentSessionScanner.AgentSessionScanner.of({
+          scan: Effect.die("unused"),
+          recentThreads: () =>
+            Stream.succeed(makeThreadOutcome(makeThread("claudeAgent"), worktree)),
+        });
+        const engine = OrchestrationEngine.OrchestrationEngineService.of({
+          dispatch: (command) => Effect.sync(() => ({ sequence: commands.push(command) })),
+          readEvents: () => Stream.empty,
+          readThreadEvents: () => Stream.empty,
+          getThreadReplayStats: () => Effect.die("unused"),
+          streamDomainEvents: Stream.empty,
+          subscribeDomainEvents: Effect.succeed(Stream.empty),
+          latestSequence: Effect.succeed(0),
+        });
+        const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+          upsert: (binding) => Effect.sync(() => void bindings.push(binding)),
+          getProvider: () => Effect.die("unused"),
+          recordImportedTranscript: () => Effect.void,
+          getBinding: () => Effect.succeed(Option.none()),
+          listThreadIds: () => Effect.die("unused"),
+          listBindings: () => Effect.die("unused"),
+        });
+
+        const result = yield* runImport({
+          scanner,
+          engine,
+          directory,
+          snapshots: makeSnapshotsLayer({ project: makeProject() }),
+        });
+
+        expect(result).toEqual({ importedCount: 1, skippedCount: 0 });
+        expect(commands.filter((command) => command.type === "thread.create")).toMatchObject([
+          { branch: worktree.branch, worktreePath: worktree.path, historyImport: true },
+        ]);
+        expect(bindings).toMatchObject([{ runtimePayload: { cwd: worktree.path } }]);
       }),
     );
 
