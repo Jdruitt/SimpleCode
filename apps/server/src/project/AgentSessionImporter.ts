@@ -234,7 +234,9 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
                 thread.source === "codex"
                   ? { threadId: thread.providerSessionId }
                   : { threadId, resume: thread.providerSessionId },
-              runtimePayload: { cwd: workspaceRoot },
+              // Providers look sessions up by the directory they ran in, so a
+              // worktree session must resume inside its worktree.
+              runtimePayload: { cwd: outcome.worktree?.path ?? workspaceRoot },
             },
             { onConflict: "ignore" },
           );
@@ -250,8 +252,8 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
             modelSelection: { instanceId: thread.providerInstanceId, model },
             runtimeMode: DEFAULT_RUNTIME_MODE,
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: null,
-            worktreePath: null,
+            branch: outcome.worktree?.branch ?? null,
+            worktreePath: outcome.worktree?.path ?? null,
             createdAt: thread.createdAt,
             historyImport: true,
           });

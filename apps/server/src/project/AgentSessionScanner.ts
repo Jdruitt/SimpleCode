@@ -168,11 +168,19 @@ export interface AgentSessionThread {
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
 }
 
+/** The linked git worktree a session ran in, when it was not the project root. */
+export interface AgentSessionWorktree {
+  readonly path: string;
+  readonly branch: string | null;
+}
+
 export type AgentSessionRecentThread =
   | {
       readonly _tag: "Importable";
       readonly thread: AgentSessionThread;
       readonly source: AgentSessionImportSource;
+      /** Set when the session belongs to one of the project's linked worktrees. */
+      readonly worktree: AgentSessionWorktree | null;
     }
   | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
@@ -686,14 +694,38 @@ export const make = Effect.gen(function* () {
   });
 
   /**
-   * Git identity of a directory, or the reason it has none. Reads `.git`
-   * directly instead of spawning git so a scan over hundreds of candidates
-   * stays cheap. A `.git` file is a `gitdir:` pointer. When it points into a
-   * `worktrees/` directory the checkout is a linked worktree, which
-   * onboarding skips because its history belongs to the main checkout.
+   * Where a directory keeps its git metadata, or the reason it has none.
+   * Reads `.git` directly instead of spawning git so a scan over hundreds of
+   * candidates stays cheap. A `.git` file is a `gitdir:` pointer. When it
+   * points into a `worktrees/` directory the checkout is a linked worktree,
+   * whose history belongs to the main checkout: onboarding does not offer it
+   * as a project and import folds its sessions into the main checkout's.
    * Submodules use the same pointer shape but live under `modules/`, and
-   * are offered like any other repository.
+   * are treated like any other repository.
    */
+  const readGitDir = Effect.fn("AgentSessionScanner.readGitDir")(function* (
+    directory: string,
+  ): Effect.fn.Return<
+    | { readonly _tag: "Repository"; readonly gitDir: string }
+    | { readonly _tag: "Worktree"; readonly gitDir: string }
+    | { readonly _tag: "NotGit" }
+  > {
+    const gitPath = path.join(directory, ".git");
+    const gitStats = yield* statOption(gitPath);
+    if (Option.isNone(gitStats)) return { _tag: "NotGit" } as const;
+    if (gitStats.value.type === "Directory") {
+      return { _tag: "Repository", gitDir: gitPath } as const;
+    }
+    const pointer = yield* fileSystem.readFileString(gitPath).pipe(Effect.orElseSucceed(() => ""));
+    const target = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
+    if (target === undefined || target.length === 0) return { _tag: "NotGit" } as const;
+    const gitDir = path.resolve(directory, target);
+    return /[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitDir)
+      ? ({ _tag: "Worktree", gitDir } as const)
+      : ({ _tag: "Repository", gitDir } as const);
+  });
+
+  /** Origin identity of a real checkout, read from its git config. */
   const readGitIdentity = Effect.fn("AgentSessionScanner.readGitIdentity")(function* (
     directory: string,
   ): Effect.fn.Return<
@@ -701,21 +733,10 @@ export const make = Effect.gen(function* () {
     | { readonly _tag: "Worktree" }
     | { readonly _tag: "NotGit" }
   > {
-    const gitPath = path.join(directory, ".git");
-    const gitStats = yield* statOption(gitPath);
-    if (Option.isNone(gitStats)) return { _tag: "NotGit" } as const;
-    let gitDir = gitPath;
-    if (gitStats.value.type !== "Directory") {
-      const pointer = yield* fileSystem
-        .readFileString(gitPath)
-        .pipe(Effect.orElseSucceed(() => ""));
-      const target = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
-      if (target === undefined || target.length === 0) return { _tag: "NotGit" } as const;
-      gitDir = path.resolve(directory, target);
-      if (/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitDir)) return { _tag: "Worktree" } as const;
-    }
+    const gitDir = yield* readGitDir(directory);
+    if (gitDir._tag !== "Repository") return gitDir;
     const configText = yield* fileSystem
-      .readFileString(path.join(gitDir, "config"))
+      .readFileString(path.join(gitDir.gitDir, "config"))
       .pipe(Effect.orElseSucceed(() => ""));
     const originUrl = parseOriginUrlFromGitConfig(configText);
     return {
@@ -725,6 +746,27 @@ export const make = Effect.gen(function* () {
         repository: parseGitHubRepositoryNameWithOwnerFromRemoteUrl(originUrl),
       },
     } as const;
+  });
+
+  /**
+   * The main checkout a linked worktree belongs to, and the branch it has
+   * checked out. The pointer targets `<main>/.git/worktrees/<name>`, so the
+   * main checkout is two levels up from the pointer (one level for a bare
+   * repository, which has no `.git` segment). `<gitdir>/HEAD` is a symbolic
+   * ref on a branch and a bare commit hash when detached.
+   */
+  const readLinkedWorktree = Effect.fn("AgentSessionScanner.readLinkedWorktree")(function* (
+    directory: string,
+  ): Effect.fn.Return<{ readonly mainRepo: string; readonly branch: string | null } | null> {
+    const gitDir = yield* readGitDir(directory);
+    if (gitDir._tag !== "Worktree") return null;
+    const commonDir = path.dirname(path.dirname(gitDir.gitDir));
+    const mainRepo = path.basename(commonDir) === ".git" ? path.dirname(commonDir) : commonDir;
+    const head = yield* fileSystem
+      .readFileString(path.join(gitDir.gitDir, "HEAD"))
+      .pipe(Effect.orElseSucceed(() => ""));
+    const branch = /^ref:\s*refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim();
+    return { mainRepo, branch: branch === undefined || branch.length === 0 ? null : branch };
   });
 
   // A large history snapshot can precede session metadata. Read bounded
@@ -1339,15 +1381,42 @@ export const make = Effect.gen(function* () {
     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
     cachedCandidates = candidates;
 
+    // A session belongs to the project when it ran in the project root
+    // (`Some(null)`) or in a linked worktree of that root (`Some(worktree)`),
+    // mirroring how Claude Desktop groups worktree sessions under their
+    // repository. T3's own sandboxes are linked worktrees too and stay
+    // excluded, since their threads already live in this database.
+    const membershipByCwd = new Map<string, Option.Option<AgentSessionWorktree | null>>();
+    const resolveMembership = Effect.fn("AgentSessionScanner.resolveMembership")(function* (
+      cwd: string,
+    ) {
+      const expanded = expandHomePath(cwd.trim());
+      if (!path.isAbsolute(expanded)) return Option.none<AgentSessionWorktree | null>();
+      const resolved = path.resolve(expanded);
+      const cached = membershipByCwd.get(resolved);
+      if (cached !== undefined) return cached;
+      let membership = Option.none<AgentSessionWorktree | null>();
+      if ((yield* directoryIdentity(resolved)) === rootIdentity) {
+        membership = Option.some(null);
+      } else if (!isExcludedProjectPath(resolved)) {
+        const realPath = yield* fileSystem
+          .realPath(resolved)
+          .pipe(Effect.orElseSucceed(() => resolved));
+        const linked = isExcludedProjectPath(realPath) ? null : yield* readLinkedWorktree(resolved);
+        if (linked !== null && (yield* directoryIdentity(linked.mainRepo)) === rootIdentity) {
+          membership = Option.some({ path: resolved, branch: linked.branch });
+        }
+      }
+      membershipByCwd.set(resolved, membership);
+      return membership;
+    });
+
     const eligibleTranscripts: Array<{
       readonly candidate: RawCandidate;
       readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
     }> = [];
     for (const candidate of candidates) {
-      const expanded = expandHomePath(candidate.cwd.trim());
-      if (!path.isAbsolute(expanded)) continue;
-      const resolved = path.resolve(expanded);
-      if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
+      if (Option.isNone(yield* resolveMembership(candidate.cwd))) continue;
 
       for (const transcript of candidate.transcripts) {
         if (
@@ -1440,11 +1509,8 @@ export const make = Effect.gen(function* () {
           if (snapshotCwd === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
-          const expandedCwd = expandHomePath(snapshotCwd.trim());
-          if (
-            !path.isAbsolute(expandedCwd) ||
-            (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity
-          ) {
+          const membership = yield* resolveMembership(snapshotCwd);
+          if (Option.isNone(membership)) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
 
@@ -1476,6 +1542,7 @@ export const make = Effect.gen(function* () {
             _tag: "Importable",
             thread: parsedThread,
             source,
+            worktree: membership.value,
           });
         }).pipe(importReadLock.withPermits(1)),
       ),

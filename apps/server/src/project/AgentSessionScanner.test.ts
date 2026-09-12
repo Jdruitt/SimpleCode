@@ -1508,6 +1508,127 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("imports sessions from the project's linked git worktrees", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const configBaseDir = yield* makeTempDir("t3code-scanner-base-");
+        const repo = yield* makeTempDir("t3code-workspace-repo-");
+        const otherRepo = yield* makeTempDir("t3code-workspace-other-repo-");
+        const detachedWorktree = yield* makeTempDir("t3code-workspace-detached-");
+        const foreignWorktree = yield* makeTempDir("t3code-workspace-foreign-");
+
+        // A linked worktree is a `.git` file pointing into the main
+        // checkout's `.git/worktrees/<name>`, whose HEAD names the branch.
+        const linkWorktree = Effect.fn(function* (input: {
+          readonly mainRepo: string;
+          readonly name: string;
+          readonly directory: string;
+          readonly head: string;
+        }) {
+          const gitDir = path.join(input.mainRepo, ".git", "worktrees", input.name);
+          yield* fileSystem.makeDirectory(gitDir, { recursive: true });
+          yield* fileSystem.writeFileString(path.join(gitDir, "HEAD"), `${input.head}\n`);
+          yield* fileSystem.makeDirectory(input.directory, { recursive: true });
+          yield* fileSystem.writeFileString(
+            path.join(input.directory, ".git"),
+            `gitdir: ${gitDir}\n`,
+          );
+        });
+
+        yield* fileSystem.makeDirectory(path.join(repo, ".git"));
+        yield* fileSystem.writeFileString(path.join(repo, ".git", "config"), "[core]\n");
+        yield* fileSystem.makeDirectory(path.join(otherRepo, ".git"));
+        const claudeWorktree = path.join(repo, ".claude", "worktrees", "feature-1e19b3");
+        yield* linkWorktree({
+          mainRepo: repo,
+          name: "feature-1e19b3",
+          directory: claudeWorktree,
+          head: "ref: refs/heads/claude/feature-1e19b3",
+        });
+        yield* linkWorktree({
+          mainRepo: repo,
+          name: "detached",
+          directory: detachedWorktree,
+          head: "0123456789abcdef0123456789abcdef01234567",
+        });
+        // T3's own sandboxes are linked worktrees too, and stay excluded.
+        const t3Worktree = path.join(configBaseDir, "worktrees", "repo", "wt-1");
+        yield* linkWorktree({
+          mainRepo: repo,
+          name: "wt-1",
+          directory: t3Worktree,
+          head: "ref: refs/heads/t3/wt-1",
+        });
+        yield* linkWorktree({
+          mainRepo: otherRepo,
+          name: "foreign",
+          directory: foreignWorktree,
+          head: "ref: refs/heads/foreign",
+        });
+
+        const claudeTranscript = (cwd: string, sessionId: string) =>
+          `${JSON.stringify({
+            type: "user",
+            cwd,
+            sessionId,
+            timestamp: "2026-08-23T12:00:00.000Z",
+            message: { role: "user", content: `Work in ${sessionId}` },
+          })}\n`;
+        const sessions = [
+          { cwd: repo, sessionId: "root" },
+          { cwd: claudeWorktree, sessionId: "claude-worktree" },
+          { cwd: detachedWorktree, sessionId: "detached-worktree" },
+          { cwd: t3Worktree, sessionId: "t3-worktree" },
+          { cwd: foreignWorktree, sessionId: "foreign-worktree" },
+        ];
+        for (const [index, session] of sessions.entries()) {
+          yield* writeTranscript({
+            filePath: path.join(
+              claudeHomePath,
+              "projects",
+              `-slug-${index}`,
+              `${session.sessionId}.jsonl`,
+            ),
+            contents: claudeTranscript(session.cwd, session.sessionId),
+            mtimeMs: nowMs - (index + 1) * 60 * 60 * 1000,
+          });
+        }
+
+        const outcomes = yield* runRecentThreadOutcomes({
+          claudeHomePath,
+          codexHomePath,
+          configBaseDir,
+          workspaceRoot: repo,
+        });
+
+        expect(
+          outcomes.map((outcome) =>
+            outcome._tag === "Importable"
+              ? {
+                  sessionId: outcome.thread.providerSessionId,
+                  worktree: outcome.worktree,
+                }
+              : outcome._tag,
+          ),
+        ).toEqual([
+          { sessionId: "root", worktree: null },
+          {
+            sessionId: "claude-worktree",
+            worktree: { path: claudeWorktree, branch: "claude/feature-1e19b3" },
+          },
+          {
+            sessionId: "detached-worktree",
+            worktree: { path: detachedWorktree, branch: null },
+          },
+        ]);
+      }),
+    );
+
     it.effect("imports history recorded with a case alias", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
