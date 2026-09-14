@@ -55,3 +55,14 @@ with its configured upstream. Choose an environment to set the default or a proj
 T3 Code only pulls when it can fast-forward and the checkout has no changed files, untracked files,
 or local commits. It skips checkouts on another branch or without an upstream. If a checkout has
 local work, resolve it yourself before automatic pulls can resume.
+
+## Import Claude Code and Codex conversations
+
+Setup offers to import existing conversations when a project is first added. To pull in
+conversations recorded since then, open the project and select **Import** under Conversations, or
+run **Import conversations** from the command palette. Both ask before reading anything.
+
+T3 Code looks at recent history for the project's folder and its linked git worktrees, adds
+conversations it does not already have, and leaves alone any conversation you have continued here.
+Running it again is safe. A large history arrives over several runs, and the notice at the end says
+when conversations are still waiting.

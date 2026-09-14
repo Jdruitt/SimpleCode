@@ -44,6 +44,7 @@ import {
   ArrowLeftIcon,
   CornerLeftUpIcon,
   FileSearchIcon,
+  DownloadIcon,
   FolderIcon,
   FolderPlusIcon,
   GitPullRequestArrowIcon,
@@ -71,6 +72,7 @@ import { useAtomValue } from "@effect/atom-react";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
+import { useImportAgentSessions } from "../hooks/useImportAgentSessions";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { useClientSettings } from "../hooks/useSettings";
@@ -612,6 +614,7 @@ function OpenCommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
 }) {
   const navigate = useNavigate();
+  const importAgentSessions = useImportAgentSessions();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
@@ -1850,6 +1853,32 @@ function OpenCommandPaletteDialog(props: {
           to: "/projects/$projectKey",
           params: { projectKey: contextualProjectGroup.projectKey },
         });
+      },
+    });
+    actionItems.push({
+      kind: "action",
+      value: "action:import-agent-sessions",
+      searchTerms: [
+        "import",
+        "conversations",
+        "history",
+        "claude code",
+        "codex",
+        "sessions",
+        "transcripts",
+      ],
+      title: "Import conversations",
+      description: contextualProjectGroup.displayName,
+      icon: <DownloadIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await importAgentSessions(
+          contextualProjectGroup.memberProjects.map((member) => ({
+            environmentId: member.environmentId,
+            projectId: member.id,
+            workspaceRoot: member.workspaceRoot,
+          })),
+          contextualProjectGroup.displayName,
+        );
       },
     });
   }
