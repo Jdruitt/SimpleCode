@@ -66,11 +66,6 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
   }
 }
 
-/** A title taken from injected context such as `<system-reminder>` rather than the prompt. */
-function isMarkupTitle(title: string): boolean {
-  return title.trimStart().startsWith("<");
-}
-
 function hasImportedHistory(thread: OrchestrationThread): boolean {
   return thread.messages.some((message) => isImportedAgentSessionMessageId(message.id));
 }
@@ -133,21 +128,19 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
     .pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
     );
-  // Threads named after injected context markup were imported before the
-  // title rules learned to skip it. Leaving their transcripts out of the
-  // completed set makes the scanner read exactly those once more, and the
-  // existing thread takes the better title below. Every other completed
-  // transcript stays closed, which keeps retries cheap.
+  // A transcript recorded under older title rules names its thread from those
+  // rules, which the thread then keeps forever. Leave exactly those out of the
+  // completed set: the scanner reads them once more and the existing thread
+  // takes the better title below, after which the record carries the current
+  // revision and closes again. Everything else stays closed, so a retry after
+  // hitting the per-import cap costs nothing extra.
   const retitleThreadIds = new Set<ThreadId>();
   for (const entry of completedSources) {
+    if (entry.source.titleVersion === AgentSessionScanner.AGENT_SESSION_TITLE_VERSION) continue;
     const existing = yield* snapshots
       .getThreadDetailById(entry.threadId)
       .pipe(Effect.orElseSucceed(() => Option.none<OrchestrationThread>()));
-    if (
-      Option.isSome(existing) &&
-      isMarkupTitle(existing.value.title) &&
-      !hasImportBlockingActivity(existing.value, true)
-    ) {
+    if (Option.isSome(existing) && !hasImportBlockingActivity(existing.value, true)) {
       retitleThreadIds.add(entry.threadId);
     }
   }

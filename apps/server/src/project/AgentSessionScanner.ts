@@ -259,6 +259,13 @@ function splitTranscriptRecords(contents: string, limit: number): string[] {
   return records.split("\n", limit);
 }
 
+/**
+ * Revision of the rules that turn a transcript into a thread title. Bump it
+ * whenever those rules change: the importer re-reads transcripts recorded
+ * under an older revision once, so existing threads pick up the better title.
+ */
+export const AGENT_SESSION_TITLE_VERSION = 1;
+
 const MAX_DERIVED_TITLE_LENGTH = 100;
 const MARKUP_BLOCK_PATTERN = /<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
 const BARE_TAG_LINE_PATTERN = /^<\/?[a-z][\w-]*(?:\s[^>]*)?>$/i;
@@ -1565,6 +1572,7 @@ export const make = Effect.gen(function* () {
             provider: parsedThread.source,
             providerInstanceId: parsedThread.providerInstanceId,
             providerSessionId: parsedThread.providerSessionId,
+            titleVersion: AGENT_SESSION_TITLE_VERSION,
           };
           const sessionKey = `${parsedThread.providerInstanceId}\0${parsedThread.providerSessionId}`;
           if (importedSessions.has(sessionKey)) {

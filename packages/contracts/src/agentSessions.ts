@@ -17,6 +17,13 @@ export const AgentSessionImportSource = Schema.Struct({
   device: Schema.Number,
   inode: Schema.NullOr(Schema.Number),
   birthtimeMs: Schema.NullOr(Schema.Number),
+  /**
+   * Which revision of the title rules named the thread this transcript was
+   * imported into. Absent on records written before the field existed. A
+   * record behind the current revision earns exactly one re-read, so threads
+   * keep up with title rules without reopening the whole completed set.
+   */
+  titleVersion: Schema.optional(NonNegativeInt),
 });
 export type AgentSessionImportSource = typeof AgentSessionImportSource.Type;
 
