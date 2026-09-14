@@ -342,7 +342,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       }),
     );
 
-    it.effect("retitles untouched imported threads named after context markup", () =>
+    it.effect("re-reads imported threads titled by superseded title rules", () =>
       Effect.gen(function* () {
         const commands: Array<OrchestrationCommand> = [];
         let completedSources: ReadonlyArray<AgentSessionImportSource> | undefined;
@@ -354,12 +354,12 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         // History import settles the thread; a follow-up marks it as touched.
         const codexThread = {
           ...makeProjectedThread({ source: "codex", imported: true }),
-          title: "<system-reminder>",
+          title: "Hi mate,",
           settledOverride: "settled" as const,
         };
         const claudeThread = {
           ...makeProjectedThread({ source: "claudeAgent", imported: true, includeFollowup: true }),
-          title: "<system-reminder>",
+          title: "Hi mate,",
           settledOverride: "settled" as const,
         };
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
@@ -414,8 +414,16 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
           snapshots: makeSnapshotsLayer({
             project: makeProject(),
             importedSources: [
+              // Recorded before the current title rules existed.
               { threadId: codexThread.id, source: codex.source },
-              { threadId: claudeThread.id, source: claude.source },
+              // Recorded by the current rules, so its title is already right.
+              {
+                threadId: claudeThread.id,
+                source: {
+                  ...claude.source,
+                  titleVersion: AgentSessionScanner.AGENT_SESSION_TITLE_VERSION,
+                },
+              },
             ],
             getThread: (threadId) =>
               threadId === codexThread.id
@@ -426,9 +434,11 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
           }),
         });
 
-        // The Claude thread has a follow-up typed in T3, so it stays completed
-        // and keeps its title; the untouched Codex thread is re-read and renamed.
-        expect(completedSources).toEqual([claude.source]);
+        // The Claude source already carries the current title version, so it
+        // stays completed; the legacy Codex source is re-read and renamed.
+        expect(completedSources).toEqual([
+          { ...claude.source, titleVersion: AgentSessionScanner.AGENT_SESSION_TITLE_VERSION },
+        ]);
         expect(result).toEqual({ importedCount: 1, skippedCount: 0 });
         expect(commands).toMatchObject([
           {

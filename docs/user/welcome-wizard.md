@@ -76,8 +76,10 @@ unreadable or unparseable conversations.
 
 Each import attempt reads up to 100 conversation files and 64 MiB per project,
 with up to 100,000 input records. Run import again to continue a large batch.
-Completed conversations are not imported again. You can continue without the
-remaining history.
+Completed conversations are not imported again, except to refresh a name that a
+newer version of T3 Code would write differently. That rename skips any
+conversation you have already continued here, so a title you are used to stays
+put. You can continue without the remaining history.
 
 You can continue without configuring agents or importing projects, or return to an earlier step
 using the setup progress bar. Navigation pauses while an import is running.

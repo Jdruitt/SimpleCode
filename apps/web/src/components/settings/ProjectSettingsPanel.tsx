@@ -41,6 +41,7 @@ import {
 import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
+import { useImportAgentSessions } from "../../hooks/useImportAgentSessions";
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -175,6 +176,7 @@ function ProjectDetail({
   const threads = useThreadShells();
   const updateProject = useAtomCommand(projectEnvironment.update, { reportFailure: false });
   const deleteProject = useAtomCommand(projectEnvironment.delete, { reportFailure: false });
+  const importAgentSessions = useImportAgentSessions();
   const projectNameEditedRef = useRef(false);
 
   const faviconPath = representative.faviconPath ?? null;
@@ -381,6 +383,33 @@ function ProjectDetail({
     ],
   );
 
+  const conversationImport = (
+    <SettingsSection title="Conversations">
+      <SettingsRow
+        title="Import from Claude Code and Codex"
+        description="Adds recent conversations run in this project's folder, including its git worktrees. Safe to run again as history grows."
+        control={
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              void importAgentSessions(
+                group.memberProjects.map((member) => ({
+                  environmentId: member.environmentId,
+                  projectId: member.id,
+                  workspaceRoot: member.workspaceRoot,
+                })),
+                group.displayName,
+              )
+            }
+          >
+            Import
+          </Button>
+        }
+      />
+    </SettingsSection>
+  );
+
   const checkoutChoices = (
     <SettingsSection title="Checkouts">
       {group.memberProjects.map((member) => (
@@ -479,6 +508,7 @@ function ProjectDetail({
           />
         </SettingsSection>
         <ProjectActionsSettings />
+        {conversationImport}
         {hasMultipleCheckouts ? checkoutChoices : null}
         <SettingsSection title="Danger">
           <SettingsRow
