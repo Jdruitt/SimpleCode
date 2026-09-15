@@ -76,6 +76,8 @@ unreadable or unparseable conversations.
 
 Each import attempt reads up to 100 conversation files and 64 MiB per project,
 with up to 100,000 input records. Run import again to continue a large batch.
+An imported conversation keeps the name Claude Code or Codex shows for it. A
+conversation those apps have not named takes its first prompt as its title.
 Completed conversations are not imported again, except to refresh a name that a
 newer version of T3 Code would write differently. That rename skips any
 conversation you have already continued here, so a title you are used to stays

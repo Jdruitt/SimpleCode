@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
+import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it } from "@effect/vitest";
 import {
   type OrchestrationProjectShell,
@@ -1508,6 +1509,70 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("names Codex threads after the name Codex shows for them", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+
+        const codexRollout = (sessionId: string, prompt: string) =>
+          [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: sessionId, cwd: workspace },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              timestamp: "2026-08-24T10:00:00.000Z",
+              payload: { type: "user_message", message: prompt },
+            }),
+          ].join("\n");
+        yield* writeTranscript({
+          filePath: path.join(codexHomePath, "sessions", "2026", "08", "24", "rollout-named.jsonl"),
+          contents: codexRollout("codex-named", "chào bạn, bạn hãy review spec này"),
+          mtimeMs: nowMs - 60 * 60 * 1000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2026",
+            "08",
+            "24",
+            "rollout-unnamed.jsonl",
+          ),
+          contents: codexRollout("codex-unnamed", "Fix the build"),
+          mtimeMs: nowMs - 2 * 60 * 60 * 1000,
+        });
+        // Codex keeps the name it displays in its state database, not in the
+        // rollout. Older state files are superseded by the highest revision.
+        const staleDb = new NodeSqlite.DatabaseSync(path.join(codexHomePath, "state_4.sqlite"));
+        staleDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT)");
+        staleDb.exec("INSERT INTO threads VALUES ('codex-named', 'Stale name')");
+        staleDb.close();
+        const db = new NodeSqlite.DatabaseSync(path.join(codexHomePath, "state_5.sqlite"));
+        db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT)");
+        db.exec(
+          "INSERT INTO threads VALUES ('codex-named', 'Review wellbeing centre API spec'), ('codex-unnamed', NULL)",
+        );
+        db.close();
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+
+        expect(threads.map((thread) => [thread.providerSessionId, thread.title])).toEqual([
+          ["codex-named", "Review wellbeing centre API spec"],
+          ["codex-unnamed", "Fix the build"],
+        ]);
+      }),
+    );
+
     it.effect("imports sessions from the project's linked git worktrees", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -2765,9 +2830,75 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.title).toBe("hi mate, do you know the reason age filter is slow?");
+    expect(thread?.title).toBe("hi mate, do you know the reason age filter is slow? Second line.");
     // Imported history keeps the prompt as written; only the title is cleaned.
     expect(thread?.messages.map((message) => message.text)).toEqual([prompt]);
+  });
+
+  it("titles a multi-line prompt with the whole prompt on one line, as the CLIs do", () => {
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        claudeUser("chào bạn,\n\nbạn có thể kiểm tra giúp mình   file này\nđược không?"),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "claude-session",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("chào bạn, bạn có thể kiểm tra giúp mình file này được không?");
+  });
+
+  it("drops the context Codex injects as user messages before the prompt", () => {
+    const codexUser = (text: string, contentItemKinds: ReadonlyArray<string>, timestamp: string) =>
+      JSON.stringify({
+        type: "response_item",
+        timestamp,
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: "turn-1",
+            content_item_kinds: contentItemKinds,
+          },
+        },
+      });
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd: "/repo" } }),
+        codexUser(
+          "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nBe nice.\n</INSTRUCTIONS>",
+          ["plugins.recommendations", "agents_md.instructions", "environments.environment_context"],
+          "2026-08-24T10:00:00.000Z",
+        ),
+        codexUser(
+          "[10:02 +07 -- nexle_user]",
+          ["hooks.additional_context"],
+          "2026-08-24T10:00:01.000Z",
+        ),
+        codexUser("chào bạn, bạn hãy review spec này", ["user.text"], "2026-08-24T10:00:02.000Z"),
+        JSON.stringify({
+          type: "response_item",
+          timestamp: "2026-08-24T10:01:00.000Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Đang đọc spec." }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "unused",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("chào bạn, bạn hãy review spec này");
+    expect(thread?.messages.map((message) => message.text)).toEqual([
+      "chào bạn, bạn hãy review spec này",
+      "Đang đọc spec.",
+    ]);
   });
 
   it("falls back to a later user message when the first one is only context markup", () => {
@@ -3324,7 +3455,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-25T08:00:00.000Z"),
     });
 
-    expect(thread?.title).toBe("## My request for Codex:");
+    expect(thread?.title).toBe("## My request for Codex: Fix the visible bug");
     expect(thread?.messages.map((message) => message.text)).toEqual([prompt]);
   });
 
