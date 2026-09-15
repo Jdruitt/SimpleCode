@@ -10,6 +10,7 @@ import { ServerConfig } from "../../config.ts";
 
 type RuntimeSqliteLayerConfig = {
   readonly filename: string;
+  readonly readonly?: boolean;
   readonly spanAttributes?: Record<string, unknown>;
 };
 
@@ -29,6 +30,13 @@ const makeRuntimeSqliteLayer = Effect.fn("makeRuntimeSqliteLayer")(function* (
   const clientModule = yield* Effect.promise<Loader>(loader);
   return clientModule.layer(config);
 }, Layer.unwrap);
+
+/**
+ * Read another program's SQLite file without touching it: no migrations, no
+ * pragmas, no write lock. Used to read Codex's own state database.
+ */
+export const makeReadonlySqliteLayer = (filename: string) =>
+  makeRuntimeSqliteLayer({ filename, readonly: true });
 
 const setup = Layer.effectDiscard(
   Effect.gen(function* () {

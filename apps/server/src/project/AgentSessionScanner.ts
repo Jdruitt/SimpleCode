@@ -38,6 +38,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   normalizeGitRemoteUrl,
@@ -49,6 +50,7 @@ import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { makeReadonlySqliteLayer } from "../persistence/Layers/Sqlite.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -108,6 +110,7 @@ const TranscriptMessage = Schema.Struct({
 
 const CodexTurnMetadata = Schema.Struct({
   turn_id: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  content_item_kinds: Schema.optional(Schema.Array(Schema.String)),
 });
 
 const TranscriptRecord = Schema.Struct({
@@ -264,26 +267,42 @@ function splitTranscriptRecords(contents: string, limit: number): string[] {
  * whenever those rules change: the importer re-reads transcripts recorded
  * under an older revision once, so existing threads pick up the better title.
  */
-export const AGENT_SESSION_TITLE_VERSION = 1;
+export const AGENT_SESSION_TITLE_VERSION = 2;
 
 const MAX_DERIVED_TITLE_LENGTH = 100;
 const MARKUP_BLOCK_PATTERN = /<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
 const BARE_TAG_LINE_PATTERN = /^<\/?[a-z][\w-]*(?:\s[^>]*)?>$/i;
 
 /**
- * Title from a prompt as the user typed it. Both CLIs prepend context markup
- * to prompts (`<system-reminder>`, `<environment_context>`, plugin hints), so
- * the raw first line is rarely the request. Drop complete markup blocks and
- * bare tag lines, then take the first line left. The imported message text is
- * never altered, only the title.
+ * Title from a prompt as the user typed it, the way both CLIs list a session
+ * they have not named: the whole prompt on one line, cut short. Both CLIs
+ * prepend context markup to prompts (`<system-reminder>`,
+ * `<environment_context>`, plugin hints), so drop complete markup blocks and
+ * bare tag lines first. The imported message text is never altered, only the
+ * title.
  */
 function deriveTitleFromPrompt(text: string): string | null {
-  for (const line of text.replace(MARKUP_BLOCK_PATTERN, "").split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || BARE_TAG_LINE_PATTERN.test(trimmed)) continue;
-    return trimmed.slice(0, MAX_DERIVED_TITLE_LENGTH).trim();
-  }
-  return null;
+  const lines = text
+    .replace(MARKUP_BLOCK_PATTERN, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !BARE_TAG_LINE_PATTERN.test(line));
+  if (lines.length === 0) return null;
+  return lines.join(" ").replace(/\s+/g, " ").slice(0, MAX_DERIVED_TITLE_LENGTH).trim();
+}
+
+/**
+ * Codex writes the context it injects ahead of a prompt (AGENTS.md, plugin
+ * hints, hook output, environment) as separate user messages, each tagged
+ * with the kinds of content it holds. A message the user actually typed
+ * carries a `user.*` kind; older rollouts tag it `unknown`. Anything else is
+ * Codex talking to itself and belongs in neither the history nor the title.
+ */
+function isCodexInjectedContext(metadata: unknown): boolean {
+  const decoded = decodeCodexTurnMetadata(metadata);
+  if (Option.isNone(decoded)) return false;
+  const kinds = decoded.value.content_item_kinds ?? [];
+  return kinds.length > 0 && !kinds.some((kind) => kind === "unknown" || kind.startsWith("user."));
 }
 
 function extractText(
@@ -390,7 +409,8 @@ function parseAgentSessionRecords(
       if (
         record.type === "response_item" &&
         record.payload?.type === "message" &&
-        record.payload.role === "user"
+        record.payload.role === "user" &&
+        !isCodexInjectedContext(record.payload.internal_chat_message_metadata_passthrough)
       ) {
         const turnId = codexTurnId(record.payload.internal_chat_message_metadata_passthrough);
         const text = extractText(record.payload.content);
@@ -510,7 +530,11 @@ function parseAgentSessionRecords(
 
     const extractedText = extractText(record.payload.content);
     if (extractedText.length === 0) continue;
-    if (record.payload.role === "user" && canonicalCodexResponseUserIndices.has(recordIndex)) {
+    if (
+      record.payload.role === "user" &&
+      (canonicalCodexResponseUserIndices.has(recordIndex) ||
+        isCodexInjectedContext(record.payload.internal_chat_message_metadata_passthrough))
+    ) {
       continue;
     }
     if (record.payload.role === "user" && hasMatchingCodexEventInTurn(extractedText)) {
@@ -1236,6 +1260,7 @@ export const make = Effect.gen(function* () {
         if (seenHomes.has(homeKey)) continue;
         seenHomes.add(homeKey);
         homes.push({ homePath, providerInstanceId: instanceId });
+        if (source === "codex") codexHomesByInstance.set(instanceId, homePath);
       }
 
       const transcriptCandidates: Array<TranscriptCandidate> = [];
@@ -1279,6 +1304,37 @@ export const make = Effect.gen(function* () {
   });
 
   let cachedCandidates: ReadonlyArray<RawCandidate> | null = null;
+  const codexHomesByInstance = new Map<ProviderInstanceId, string>();
+
+  /**
+   * Codex shows a thread under the name in its state database, not under
+   * anything written to the rollout. Read that table once per home; a missing
+   * or unreadable database (older Codex, no `name` column yet) means no names.
+   */
+  const readCodexThreadNames = Effect.fn("AgentSessionScanner.readCodexThreadNames")(function* (
+    homePath: string,
+  ) {
+    const names = new Map<string, string>();
+    const entries = yield* listDirectory(homePath);
+    const stateFile = entries
+      .flatMap((entry) => {
+        const match = /^state_(\d+)\.sqlite$/.exec(entry);
+        return match ? [{ entry, version: Number(match[1]) }] : [];
+      })
+      .toSorted((left, right) => right.version - left.version)[0];
+    if (stateFile === undefined) return names;
+    const rows = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      return yield* sql<{ readonly id: string; readonly name: string }>`
+        SELECT id, name FROM threads WHERE name IS NOT NULL AND name <> ''
+      `;
+    }).pipe(
+      Effect.provide(makeReadonlySqliteLayer(path.join(homePath, stateFile.entry))),
+      Effect.orElseSucceed(() => []),
+    );
+    for (const row of rows) names.set(row.id, row.name);
+    return names;
+  });
 
   const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
     const { candidates: raw, truncated } = yield* collectCandidates();
@@ -1420,6 +1476,21 @@ export const make = Effect.gen(function* () {
 
     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
     cachedCandidates = candidates;
+
+    const codexThreadNamesByHome = new Map<string, Map<string, string>>();
+    const codexThreadName = Effect.fn("AgentSessionScanner.codexThreadName")(function* (
+      providerInstanceId: ProviderInstanceId,
+      providerSessionId: string,
+    ) {
+      const homePath = codexHomesByInstance.get(providerInstanceId);
+      if (homePath === undefined) return null;
+      let names = codexThreadNamesByHome.get(homePath);
+      if (names === undefined) {
+        names = yield* readCodexThreadNames(homePath);
+        codexThreadNamesByHome.set(homePath, names);
+      }
+      return names.get(providerSessionId) ?? null;
+    });
 
     // A session belongs to the project when it ran in the project root
     // (`Some(null)`) or in a linked worktree of that root (`Some(worktree)`),
@@ -1566,6 +1637,11 @@ export const make = Effect.gen(function* () {
           if (parsedThread === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
+          const codexName =
+            candidate.source === "codex"
+              ? yield* codexThreadName(candidate.providerInstanceId, parsedThread.providerSessionId)
+              : null;
+          const thread = codexName === null ? parsedThread : { ...parsedThread, title: codexName };
 
           const source: AgentSessionImportSource = {
             ...identity,
@@ -1581,7 +1657,7 @@ export const make = Effect.gen(function* () {
           importedSessions.add(sessionKey);
           return Option.some<AgentSessionRecentThread>({
             _tag: "Importable",
-            thread: parsedThread,
+            thread,
             source,
             worktree: membership.value,
           });
