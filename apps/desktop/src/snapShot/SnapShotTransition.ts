@@ -114,7 +114,7 @@ function createWindow(
     resizable: false,
     show: false,
     skipTaskbar: true,
-    title: "JD Code Snapshot Animation",
+    title: "T3 Code Snapshot Animation",
     transparent: true,
     webPreferences: {
       backgroundThrottling: false,
